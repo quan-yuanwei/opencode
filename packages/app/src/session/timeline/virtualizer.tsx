@@ -64,6 +64,9 @@ const fallbackItemSize = 60
 
 const pendingMarkdown = '[data-component="markdown"]:not([data-markdown-ready])'
 
+// Content a row still waits for: a deferred body, a file view, Markdown or a diagram that has not rendered.
+const pendingContent = `[data-disclosure-pending], [data-component="file"]:not([data-file-ready]), [data-mermaid-pending], ${pendingMarkdown}`
+
 const upwardKeys = new Set(["up", "page-up", "home"])
 
 const settledEvent = { type: "scroll.settled", atReachableEnd: false } as const
@@ -262,6 +265,21 @@ export function createTimelineVirtualizer(input: Input) {
   let touchTarget: EventTarget | null = null
   // Size compensation deferred during one resize delivery, committed or dropped before the delivery ends.
   let touchAdjustment = 0
+  // Rows measured with no content still to come, or acted on: the reader may have seen them at their real height.
+  const settled = new Set<string>()
+  // The first and last of the rows in the scroll port that hold still while the size batch being applied resizes
+  // the others: all but the unsettled rows it resizes. -1 for none. Unset outside a batch, until the reader scrolls
+  // and at the start of the list.
+  let still: { first: number; last: number } | undefined
+  // Whether the reader has scrolled since they last jumped somewhere. A jump keeps the place they asked for.
+  let roaming = false
+  // The width each row was last measured at, and the last of those. Text wraps again at a new width.
+  const widths = new WeakMap<Element, number>()
+  let rowWidth = 0
+  // The row measured last changed width, a measurement only: the resize that follows it reads it once.
+  let wrapped = false
+  // Whether the part of a wrapped row the size batch is resizing lies above the reading line. Unset otherwise.
+  let aboveLine: boolean | undefined
   let maxScroll = 0
   let virtualContent: HTMLDivElement | undefined
   let rowLayer: HTMLDivElement | undefined
@@ -371,7 +389,16 @@ export function createTimelineVirtualizer(input: Input) {
       measuredElements.add(element)
       const box = entry?.borderBoxSize[0]
 
-      if (box) return Math.round(box.blockSize)
+      if (box) {
+        wrapped = (widths.get(element) ?? box.inlineSize) !== box.inlineSize
+        widths.set(element, box.inlineSize)
+
+        // No row has been seen at the height it has at a new width.
+        if (box.inlineSize !== rowWidth) settled.clear()
+        rowWidth = box.inlineSize
+
+        return Math.round(box.blockSize)
+      }
 
       if (initial) {
         const size = instance.itemSizeCache.get(instance.options.getItemKey(instance.indexFromElement(element)))
@@ -423,7 +450,7 @@ export function createTimelineVirtualizer(input: Input) {
   })
 
   const resizeItem = virtualizer.resizeItem
-  const pendingSizes = new Map<number, { key: string; size: number }>()
+  const pendingSizes = new Map<number, { key: string; size: number; wrapped: boolean }>()
   let resizeScheduled = false
 
   const flushHeldScroll = () => {
@@ -435,6 +462,9 @@ export function createTimelineVirtualizer(input: Input) {
   // Read the whole measurement delivery before committing reactive row sizes.
   // Otherwise each row can render and force layout before the next is measured.
   virtualizer.resizeItem = (index, size) => {
+    const rewrapped = wrapped
+    wrapped = false
+
     if (!active()) return
     const row = rows()[index]
 
@@ -443,11 +473,12 @@ export function createTimelineVirtualizer(input: Input) {
 
     if ((virtualizer.itemSizeCache.get(key) ?? fallbackItemSize) === size) {
       pendingSizes.delete(index)
+      settle(key)
 
       return
     }
 
-    pendingSizes.set(index, { key, size })
+    pendingSizes.set(index, { key, size, wrapped: rewrapped || pendingSizes.get(index)?.wrapped === true })
 
     if (resizeScheduled) return
     resizeScheduled = true
@@ -467,6 +498,35 @@ export function createTimelineVirtualizer(input: Input) {
       // The hidden pinned mount needs one bottom write after the whole batch,
       // not a layout-forcing scroll adjustment for every measured row.
       dispatchCold(SIZES_FLUSHING)
+      // At the start of the list the start is what stays, as the end does for a reader who follows it.
+      const offset = virtualizer.scrollOffset ?? 0
+      const top = offset + virtualizer.options.scrollPaddingStart
+      const range = roaming && offset > 0 ? virtualizer.range : null
+      const resizing = new Set(sizes.flatMap(([index, value]) => (settled.has(value.key) ? [] : [index])))
+
+      const held = range
+        ? Array.from(
+            { length: range.endIndex - range.startIndex + 1 },
+            (_, offset) => range.startIndex + offset,
+          ).filter((index) => !resizing.has(index) && (virtualizer.measurementsCache[index]?.end ?? top) > top)
+        : undefined
+
+      still = held && { first: held[0] ?? -1, last: held.at(-1) ?? -1 }
+      // A row that wrapped again keeps the reading line at the same fraction of its height: the size in between is
+      // the row with only the part of its change above the line.
+      const line = readingLine(offset)
+
+      const between = new Map(
+        sizes.flatMap(([index, value]) => {
+          const item = value.wrapped ? virtualizer.measurementsCache[index] : undefined
+
+          if (!item) return []
+          const above = offset > 0 && item.size > 0 ? Math.min(1, Math.max(0, (line - item.start) / item.size)) : 0
+
+          return [[index, Math.round(item.size + (value.size - item.size) * above)] as const]
+        }),
+      )
+
       batch(() => {
         scrollHeld = true
 
@@ -475,23 +535,29 @@ export function createTimelineVirtualizer(input: Input) {
             const row = rows()[index]
 
             if (!row || TimelineRow.key(row) !== value.key) return
-            resizeItem(index, value.size)
+            const split = between.get(index)
 
-            // TanStack recalculates its range after each resize. Advance the
-            // logical fold before deciding whether the next row needs anchoring.
-            if (!touchAdjustment) return
-            const delta = touchAdjustment
-            touchAdjustment = 0
+            // TanStack compensates a resize in full or not at all, so a wrapped row resizes in two steps.
+            ;(split === undefined ? [value.size] : [split, value.size]).forEach((size, step) => {
+              aboveLine = split === undefined ? undefined : step === 0
+              resizeItem(index, size)
 
-            // A delta deferred under momentum that has since ended is dropped rather than translating the rows.
-            if (!defersAdjustments(input.follow.peek())) return
-            setRendering("scrollAdjustment", (value) => value + delta)
-            const root = listRoot()
+              // TanStack recalculates its range after each resize. Advance the
+              // logical fold before deciding whether the next row needs anchoring.
+              if (!touchAdjustment) return
+              const delta = touchAdjustment
+              touchAdjustment = 0
 
-            if (!root) return
-            // The native offset is read next, so it has to include any correction still held.
-            flushHeldScroll()
-            reportOffset?.(root.scrollTop, virtualizer.isScrolling)
+              // A delta deferred under momentum that has since ended is dropped rather than translating the rows.
+              if (!defersAdjustments(input.follow.peek())) return
+              setRendering("scrollAdjustment", (value) => value + delta)
+              const root = listRoot()
+
+              if (!root) return
+              // The native offset is read next, so it has to include any correction still held.
+              flushHeldScroll()
+              reportOffset?.(root.scrollTop, virtualizer.isScrolling)
+            })
           })
         } finally {
           scrollHeld = false
@@ -499,6 +565,9 @@ export function createTimelineVirtualizer(input: Input) {
           flushHeldScroll()
         }
       })
+      aboveLine = undefined
+      still = undefined
+      sizes.forEach(([, value]) => settle(value.key))
       dispatchCold(SIZES_FLUSHED)
       pinAnchor()
 
@@ -514,14 +583,45 @@ export function createTimelineVirtualizer(input: Input) {
   }
 
   onCleanup(() => pendingSizes.clear())
-  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, delta, instance) => {
-    // Prepended rows can resize more than once as deferred content mounts. Keep
-    // compensating while they remain entirely above the visible content fold.
-    const offset = (instance.scrollOffset ?? 0) + instance.scrollAdjustments
+  // A row settles once it is measured with no content still to come.
+  function settle(key: string) {
+    if (settled.has(key)) return
+    const element = virtualizer.elementsCache.get(key)
 
-    const adjust = addedKeys.has(String(item.key))
-      ? item.end <= offset + instance.options.scrollMargin
-      : isAboveFold(item, instance.range?.startIndex, offset + instance.options.scrollPaddingStart)
+    if (element?.isConnected && !element.querySelector(pendingContent)) settled.add(key)
+  }
+
+  // What the reader sees is the scroll port, from the session header's fade to the composer region. The reading line
+  // is 40% of the way down it.
+  function readingLine(offset: number) {
+    const top = offset + virtualizer.options.scrollPaddingStart
+
+    return top + (offset + (virtualizer.scrollRect?.height ?? 0) - top) * 0.4
+  }
+
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, delta, instance) => {
+    const offset = (instance.scrollOffset ?? 0) + instance.scrollAdjustments
+    const key = String(item.key)
+    const below = !!still && still.last > item.index
+    const above = !!still && still.first >= 0 && still.first < item.index
+
+    // What stays where it is depends on what changed.
+    // A row that wrapped again at a new width: the reading line, so the part of its change above the line is
+    // compensated.
+    // A settled row: its own top edge, so it is compensated only while the reader cannot see it. Prepended rows can
+    // resize more than once as deferred content mounts.
+    // A row that has not settled has not been seen at its real height, so once the reader scrolls, the rows in the
+    // scroll port that hold still: with those on one side of it, they stay. With them on both sides or on neither,
+    // the reading line stays: a row that starts above it grows upward, any other downward.
+    const adjust =
+      aboveLine ??
+      (!still || settled.has(key)
+        ? addedKeys.has(key)
+          ? item.end <= offset + instance.options.scrollMargin
+          : isAboveFold(item, instance.range?.startIndex, offset + instance.options.scrollPaddingStart)
+        : below !== above
+          ? below
+          : item.start < readingLine(offset))
 
     if (!defersAdjustments(input.follow.peek())) return adjust
 
@@ -561,6 +661,7 @@ export function createTimelineVirtualizer(input: Input) {
     const key = found.group.key
 
     prepareNavigation()
+    roaming = false
     // Opening the group and anchoring its row render the tool synchronously, wherever the row is.
     batch(() => {
       setToolOpen(
@@ -703,6 +804,7 @@ export function createTimelineVirtualizer(input: Input) {
 
       if (index === undefined) return
       prepareNavigation()
+      roaming = false
       virtualizer.scrollToIndex(index, { align: partIndex >= 0 ? "center" : "start" })
     })
     input.setScrollToEnd?.((behavior) => {
@@ -710,6 +812,7 @@ export function createTimelineVirtualizer(input: Input) {
 
       if (!active() || !root?.isConnected) return
       flushTouchAdjustment()
+      roaming = false
       input.follow.dispatch({ type: "follow" })
 
       // Glide only the final screen. Crossing the whole history smoothly would stream every row through the virtualizer.
@@ -957,6 +1060,7 @@ export function createTimelineVirtualizer(input: Input) {
   // Only an upward intent reads the scroll range, as content that does not overflow cannot move.
   function dispatchIntent(upward: boolean) {
     const root = listRoot()
+    roaming = true
     intentEvent.upward = upward
     intentEvent.overflow = upward && !!root && root.scrollHeight - root.clientHeight > MIN_OVERFLOW
     input.follow.dispatch(intentEvent)
@@ -1037,6 +1141,8 @@ export function createTimelineVirtualizer(input: Input) {
   const handleListPointerDown = (event: PointerEvent) => {
     if (!active() || event.button === 2) return
     input.onUserScroll(event.target)
+    // A held pointer scrolls for the reader: a thumb drag, an autoscroll, a selection dragged past an edge.
+    roaming = true
     input.follow.dispatch(pointerDownEvent)
   }
 
@@ -1223,15 +1329,22 @@ export function createTimelineVirtualizer(input: Input) {
           viewportRef={bindListRoot}
           thumbContainer={visibleArea()}
           thumbHoverTarget={viewRoot()}
-          onBeforeScroll={prepareNavigation}
+          onBeforeScroll={() => {
+            prepareNavigation()
+            roaming = true
+          }}
           verticalScrollAdjustment={rendering.scrollAdjustment}
           onWheel={handleListWheel}
           onTouchStart={handleListTouchStart}
           onKeyDown={handleListKeyDown}
           onScroll={handleListScroll}
-          onClick={() => {
+          onClick={(event) => {
             // Following would scroll a selection away.
             if (window.getSelection()?.toString()) input.follow.dispatch({ type: "detach" })
+            // The reader acts on a row they are looking at, so what it opens grows downward from where it is.
+            const key = event.target.closest<HTMLElement>("[data-timeline-key]")?.dataset.timelineKey
+
+            if (key) settled.add(key)
           }}
           class="relative min-w-0 w-full h-full"
           style={{ "--sticky-accordion-top": input.showHeader() ? "var(--session-header-height, 48px)" : "0px" }}
