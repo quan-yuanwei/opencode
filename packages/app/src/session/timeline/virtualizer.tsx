@@ -1002,7 +1002,9 @@ export function createTimelineVirtualizer(input: Input) {
   const handleListWheel = (event: WheelEvent) => {
     if (!active()) return
     input.onUserScroll(event.target)
-    dispatchIntent(event.deltaY < 0)
+
+    // A sideways wheel, over a code block for example, is not toward the end.
+    if (event.deltaY) dispatchIntent(event.deltaY < 0)
   }
 
   const handleListTouchStart = (event: TouchEvent) => {

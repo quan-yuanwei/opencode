@@ -138,6 +138,7 @@ This section is the single source for what may move or restyle the session timel
 - Put each scroll write that the timeline makes between `readScroll` and `syncScroll`. A write outside them counts as the reader's scroll: upward, it stops following.
 - A view that is not shown leaves the document and comes back at offset 0. That is not the reader scrolling to the top: the ledger starts over at the first read after the view returns (`seen.lost`).
 - Other code that scrolls the timeline up takes the reader off the end, as navigation must. Code that only holds a control in place while its row resizes must not scroll when the view is at its end. See `change` in `packages/session-ui/src/tools/tool-renderer.tsx`.
+- A wheel or scroll key toward the end that lands within `REJOIN_DISTANCE` of it follows again: a reply that streams moves the end away while the scroll is on its way there. Navigation that lands there does not follow, because that would scroll its target away.
 - Keepers: "stays where navigation sent the view when a shrinking scroll range clamps it to the end" in `src/session/timeline/machine.test.ts`; "keeps a reader who left the end with … in place while the reply streams" and "goes on following the reply after a group collapses from its stuck header" in `e2e/regression/timeline-stream.spec.ts`.
 - To check by hand: in a session that streams, leave the end with Ctrl+Home, the scrollbar, middle-click autoscroll, and PageUp after a click on a tool header. The timeline must stay where each one put it, and must follow again after End.
 
