@@ -280,8 +280,21 @@ export function createTimelineVirtualizer(input: Input) {
     },
   )
   let scrollTop = 0
+  // The offset and range the timeline last read, and how far the reader has moved the offset since the last scroll
+  // event. `lost`: the view left the document, which drops its offset, so the next read starts over. Measurements
+  // only: whether the reader left the end is the follow machine's to decide.
+  const seen = { top: 0, max: 0, reader: 0, lost: false }
+
   // Reused for every scroll: the transition only reads it, so a scroll allocates nothing.
-  const scrollEvent = { type: "scroll" as const, scrollTop: 0, previousTop: 0, maxScroll: 0, previousMaxScroll: 0 }
+  const scrollEvent = {
+    type: "scroll" as const,
+    scrollTop: 0,
+    previousTop: 0,
+    maxScroll: 0,
+    previousMaxScroll: 0,
+    reader: 0,
+  }
+
   const intentEvent = { type: "scroll.intent" as const, upward: false, overflow: false }
   const touchDragEvent = { type: "touch.drag" as const, overflow: false }
   let reportOffset: ((offset: number, scrolling: boolean) => void) | undefined
@@ -298,6 +311,9 @@ export function createTimelineVirtualizer(input: Input) {
     observeElementRect: (instance, callback) => {
       reportRect = (rect) => {
         const root = listRoot()
+
+        // A taller viewport shortens the scroll range. Read the clamp before anything else grows the range again.
+        if (root) readScroll(root)
         batch(() => {
           // The container-responsive header can be 48px or 80px.
           setHeaderHeight(
@@ -344,6 +360,10 @@ export function createTimelineVirtualizer(input: Input) {
 
       return observeElementOffsetReconnectAware(instance, reportOffset, () => {
         if (!active()) return
+        const root = listRoot()
+
+        // The reattached element lost its offset, which is not the reader scrolling to the top.
+        if (root) syncScroll(root)
         virtualContent?.querySelectorAll<HTMLDivElement>("[data-index]").forEach(virtualizer.measureElement)
 
         if (input.follow.following()) virtualizer.scrollToEnd()
@@ -380,11 +400,16 @@ export function createTimelineVirtualizer(input: Input) {
       if (!active()) return
 
       if (coldMountFlushing(untrack(coldMount)) && input.follow.following()) return
+      const root = instance.scrollElement
+
+      if (root) readScroll(root)
       touchAdjustment = 0
       setRendering("scrollAdjustment", 0)
 
       if (virtualContent) virtualContent.style.height = `${instance.getTotalSize()}px`
       elementScroll(offset, options, instance)
+
+      if (root) syncScroll(root)
     },
     get getItemKey() {
       return getItemKey()
@@ -447,6 +472,10 @@ export function createTimelineVirtualizer(input: Input) {
         return
       }
 
+      const root = listRoot()
+
+      // Rows that left the list shorten the scroll range. Read the clamp before these sizes grow the range again.
+      if (root && input.follow.following()) readScroll(root)
       // The hidden pinned mount needs one bottom write after the whole batch,
       // not a layout-forcing scroll adjustment for every measured row.
       dispatchCold(SIZES_FLUSHING)
@@ -478,7 +507,6 @@ export function createTimelineVirtualizer(input: Input) {
       dispatchCold(CHECK_REQUESTED)
 
       if (untrack(coldHidden) || !input.follow.following()) return
-      const root = listRoot()
 
       // Reopening a settled scroll-to-end operation can fight subsequent keyboard scrolling.
       if (root && !atReachableEnd(root)) virtualizer.scrollToEnd()
@@ -611,6 +639,7 @@ export function createTimelineVirtualizer(input: Input) {
     const root = listRoot()
 
     if (!adjustment || !root) return
+    readScroll(root)
     // Transfer the translation into the native offset in the same paint.
     batch(() => {
       setRendering("scrollAdjustment", 0)
@@ -618,6 +647,7 @@ export function createTimelineVirtualizer(input: Input) {
       if (virtualContent) virtualContent.style.height = `${virtualizer.getTotalSize()}px`
       elementScroll(Math.max(0, root.scrollTop + adjustment), {}, virtualizer)
     })
+    syncScroll(root)
   }
 
   // A row mounts with the row and the place it draws, so it never has to find either. TanStack lists the rows it last
@@ -732,9 +762,39 @@ export function createTimelineVirtualizer(input: Input) {
   let viewportObserver: ResizeObserver | undefined
   let revealTimer: ReturnType<typeof setTimeout> | undefined
 
+  // Reads where the view is and counts its movement since the last read as the reader's. Every scroll write the
+  // timeline makes sits between a `readScroll` and a `syncScroll`, so its own movement never counts, even when the
+  // browser folds it into the same scroll event as the reader's.
+  function readScroll(root: HTMLDivElement) {
+    // A view comes back to the document at offset 0. That is not the reader scrolling to the top.
+    if (seen.lost || !root.isConnected) {
+      seen.reader = 0
+
+      return syncScroll(root)
+    }
+
+    const max = root.scrollHeight - root.clientHeight
+    // Rubber-banding runs the offset past the range and back, which moves nothing in it.
+    const top = Math.min(Math.max(0, root.scrollTop), max)
+    // A scroll range that shrinks takes a view at its end up with it: the browser's clamp, not the reader.
+    const clamped = top < seen.top && max < seen.max && max - top <= ZOOM_SLACK
+
+    if (!clamped) seen.reader += top - seen.top
+    seen.top = top
+    seen.max = max
+  }
+
+  /** Takes the offset and range as they are now, after a write of the timeline's own or a reset by the browser. */
+  function syncScroll(root: HTMLDivElement) {
+    seen.lost = !root.isConnected
+    seen.max = root.scrollHeight - root.clientHeight
+    seen.top = Math.min(Math.max(0, root.scrollTop), seen.max)
+  }
+
   // Within the zoom slack only a write finds the end the browser reaches: one that does not move proves the view is
   // already there, and one that does is undone before anything paints.
   function atReachableEnd(root: HTMLDivElement) {
+    readScroll(root)
     const top = root.scrollTop
     const distance = root.scrollHeight - root.clientHeight - top
 
@@ -745,6 +805,7 @@ export function createTimelineVirtualizer(input: Input) {
 
     if (root.scrollTop === top) return true
     root.scrollTop = top
+    syncScroll(root)
 
     return false
   }
@@ -755,6 +816,7 @@ export function createTimelineVirtualizer(input: Input) {
     const root = listRoot()
 
     if (!input.follow.following() || !virtualContent || !root) return false
+    readScroll(root)
     // scrollToEnd computes its target from the DOM, not the new size cache.
     virtualContent.style.height = `${virtualizer.getTotalSize()}px`
 
@@ -881,6 +943,8 @@ export function createTimelineVirtualizer(input: Input) {
       active,
       (value) => {
         dispatchCold(value ? ACTIVATED : DEACTIVATED)
+        // A view that is not shown leaves the document, and comes back without its offset.
+        seen.lost = true
 
         if (value) return
         // A view that goes inactive mid-touch never sees its finger lift; its translation would outlive the gesture.
@@ -911,12 +975,13 @@ export function createTimelineVirtualizer(input: Input) {
     setListRoot(root)
     scrollTop = root.scrollTop
     maxScroll = root.scrollHeight - root.clientHeight
+    syncScroll(root)
 
     if (active()) input.setScrollRef(root)
     viewportObserver?.observe(root)
     dispatchCold(CHECK_REQUESTED)
-    // The scrollbar thumb sits beside the viewport and stops its pointerdown from propagating, so
-    // listen on the ScrollView root in the capture phase: thumb drags are user scrolls too.
+    // Capture on the ScrollView root, so a press that something inside stops from propagating still counts. The
+    // scrollbar thumb is portalled out of it: a thumb drag shows as the reader's movement in `handleListScroll`.
     const scrollView = root.parentElement
 
     if (!scrollView) return
@@ -1058,12 +1123,15 @@ export function createTimelineVirtualizer(input: Input) {
   const handleListScroll = (event: Event & { currentTarget: HTMLDivElement }) => {
     if (!active()) return
     const root = event.currentTarget
+    readScroll(root)
     scrollEvent.previousTop = scrollTop
     scrollEvent.previousMaxScroll = maxScroll
     scrollTop = root.scrollTop
     maxScroll = root.scrollHeight - root.clientHeight
     scrollEvent.scrollTop = scrollTop
     scrollEvent.maxScroll = maxScroll
+    scrollEvent.reader = seen.reader
+    seen.reader = 0
     input.follow.dispatch(scrollEvent)
     dispatchCold(CHECK_REQUESTED)
     input.onScheduleScrollState(root)
@@ -1122,6 +1190,10 @@ export function createTimelineVirtualizer(input: Input) {
               // Measure the mounted tail and pin it in this render's microtask instead.
               queueMicrotask(() => {
                 if (!input.follow.following() || !virtualContent?.isConnected) return
+                const root = listRoot()
+
+                // A row that left the list shortens the scroll range. Read the clamp before these sizes grow it again.
+                if (root) readScroll(root)
                 virtualizer.elementsCache.forEach((item) => {
                   if (item.isConnected) virtualizer.resizeItem(virtualizer.indexFromElement(item), item.offsetHeight)
                 })
