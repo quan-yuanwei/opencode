@@ -239,6 +239,40 @@ test.describe("timeline history", () => {
     await expect.poll(positions).toEqual(before)
   })
 
+  test("Jump to latest glides on while an older page loads above the view", async ({ page }) => {
+    // A glide lets no other scroll jump the view to the end. The scroll that keeps the view's place when history
+    // loads above it must still count, or the older page shows for a frame before the glide brings the view back.
+    const older = Promise.withResolvers<void>()
+    const requests: { before?: string; phase: "start" | "end" }[] = []
+    await openStressTarget(page, {
+      beforeMessagesResponse: ({ before }) => (before ? older.promise : Promise.resolve()),
+      onMessages: (request) => requests.push(request),
+    })
+    const scroller = timelineScroller(page)
+    await scroller.hover()
+    await page.mouse.wheel(0, -100_000)
+    await expect.poll(() => requests.some((request) => request.before && request.phase === "start")).toBe(true)
+    await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(1)
+    const height = await scroller.evaluate((element) => element.scrollHeight)
+
+    const fromEnd = () =>
+      scroller.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop)
+
+    // The glide runs on frames, so the test steps them. See "tab preview opens cold" in tabs.spec.ts for the pause.
+    const start = Date.now()
+    await page.clock.install({ time: start })
+    await page.clock.pauseAt(start + 10_000)
+    await page.getByRole("button", { name: "Jump to latest", exact: true }).click()
+    await page.clock.runFor(100)
+    const left = await fromEnd()
+    older.resolve()
+    await expect.poll(() => scroller.evaluate((element) => element.scrollHeight)).toBeGreaterThan(height)
+    // No frame has run since, so only the older page could have moved the view.
+    expect(await fromEnd()).toBeLessThanOrEqual(left)
+    await page.clock.runFor(2_000)
+    await expect.poll(fromEnd).toBeLessThanOrEqual(1)
+  })
+
   test("mounts every part once and in order while paging to the start", async ({ page }) => {
     test.setTimeout(240_000)
     const errors = trackPageErrors(page)
