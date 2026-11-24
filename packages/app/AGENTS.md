@@ -129,6 +129,14 @@ This section is the single source for what may move or restyle the session timel
 - Keeper: "a focused control that scrolls out of the mounted rows leaves the timeline where it was scrolled" in `e2e/regression/session-timeline-accessibility.spec.ts`.
 - To check by hand: click a tool header, a link and a notice in the timeline, then scroll up and down with the wheel. The timeline must follow the wheel.
 
+### Rows that load above the reader
+
+- Older history loads above rows the reader is looking at. The virtualizer keeps the first row in view where it was, so the rows stay still only if no mounted row changes when the row before it arrives.
+- Never give a row space, a divider or a label above its content that depends on the row before it. That row grows on top when its predecessor loads, and everything in view moves down: 16 to 32px on every page of the New timeline while its rows took their gap on top.
+- The row directly above holds the space between two rows, below its own content. A row that starts a turn gets a row of its own for it, the turn gap, which arrives and leaves with the turn. `timelineGaps` in `packages/session-ui/src/timeline-next/spacing.ts` decides this for the New timeline.
+- Keeper: "keeps the New timeline's rows fixed while older pages land in a turn and above a prompt" in `e2e/regression/timeline-history.spec.ts`.
+- To check by hand: scroll to the top of the loaded history with the network throttled, and watch the first rows while the older page lands.
+
 ### `:has()` selectors
 
 - Chromium rechecks an element's `:has()` when focus moves, an attribute changes, or an element is added or removed near it. In and around the timeline, that happens many times a second during a scroll.
