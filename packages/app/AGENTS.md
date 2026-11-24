@@ -129,6 +129,13 @@ This section is the single source for what may move or restyle the session timel
 - Keeper: "a focused control that scrolls out of the mounted rows leaves the timeline where it was scrolled" in `e2e/regression/session-timeline-accessibility.spec.ts`.
 - To check by hand: click a tool header, a link and a notice in the timeline, then scroll up and down with the wheel. The timeline must follow the wheel.
 
+### Following the end
+
+- The follow state (`src/session/timeline/machine.ts`) decides whether the timeline holds the newest content at the bottom. It stops when the reader scrolls up, and it resumes when the reader scrolls to the end.
+- A scroll range that shrinks moves the offset without the reader: the browser clamps the offset to the new end. For a view that navigation or a selection sent somewhere (the `detach` event), that is not a return to the end. A cold link to a message detached the timeline, the rows' real sizes then shortened the range, and the clamp counted as an arrival: the session opened on its latest message and dropped the link's hash.
+- A reader who scrolled away and whom a clamp brings to the end follows again. At the end a wheel toward it scrolls nothing, so that reader would have no other way back.
+- Keeper: "stays where navigation sent the view when a shrinking scroll range clamps it to the end" in `src/session/timeline/machine.test.ts`.
+
 ### `:has()` selectors
 
 - Chromium rechecks an element's `:has()` when focus moves, an attribute changes, or an element is added or removed near it. In and around the timeline, that happens many times a second during a scroll.
